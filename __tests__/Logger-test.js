@@ -112,7 +112,8 @@ test('Test oversized messages are truncated before being sent to the server', ()
     // `info()` prepends the "[info] " prefix, so build the raw message minus that prefix length
     // to land the final message exactly `omittedCount` characters over the cap.
     const prefixLength = '[info] '.length;
-    const rawMessage = 'x'.repeat(maxLength + omittedCount - prefixLength);
+    const overCapLength = maxLength + omittedCount;
+    const rawMessage = 'x'.repeat(overCapLength - prefixLength);
     LogWithLimit.info(rawMessage, true);
 
     const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
