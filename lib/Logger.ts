@@ -22,6 +22,12 @@ type LoggerOptions = {
 
 const MAX_LOG_LINES_BEFORE_FLUSH = 50;
 
+// The server drops (and alerts on) any single log message whose byte length exceeds 1MB, so cap
+// each message just below that. We truncate rather than drop so oversized lines are still logged
+// (head of the message + a marker) instead of being lost. The margin leaves room for the marker.
+const ONE_MEGABYTE = 1024 * 1024;
+const MAX_LOG_MESSAGE_LENGTH = ONE_MEGABYTE - 1024;
+
 export default class Logger {
     logLines: LogLine[];
 
@@ -99,8 +105,14 @@ export default class Logger {
             // Silently fail if getContextEmail throws - logging should not crash
         }
 
+        let cappedMessage = message;
+        if (message.length > MAX_LOG_MESSAGE_LENGTH) {
+            const omittedCount = message.length - MAX_LOG_MESSAGE_LENGTH;
+            cappedMessage = `${message.slice(0, MAX_LOG_MESSAGE_LENGTH)}…[truncated ${omittedCount} characters]`;
+        }
+
         const length = this.logLines.push({
-            message,
+            message: cappedMessage,
             parameters,
             onlyFlushWithOthers,
             timestamp: new Date(),

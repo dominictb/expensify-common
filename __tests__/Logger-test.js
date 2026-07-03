@@ -99,6 +99,42 @@ test('Test Log.client()', () => {
     expect(mockClientLoggingCallback).toHaveBeenCalledWith('Test', '');
 });
 
+test('Test oversized messages are truncated before being sent to the server', () => {
+    const mockCallback = jest.fn();
+    const LogWithLimit = new Logger({
+        serverLoggingCallback: mockCallback,
+        clientLoggingCallback: jest.fn(),
+    });
+
+    const oneMegabyte = 1024 * 1024;
+    const maxLength = oneMegabyte - 1024;
+    const omittedCount = 500;
+    // `info()` prepends the "[info] " prefix, so build the raw message minus that prefix length
+    // to land the final message exactly `omittedCount` characters over the cap.
+    const prefixLength = '[info] '.length;
+    const rawMessage = 'x'.repeat((maxLength + omittedCount) - prefixLength);
+    LogWithLimit.info(rawMessage, true);
+
+    const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
+    const {message} = packet[0];
+    expect(message.length).toBe(maxLength + `…[truncated ${omittedCount} characters]`.length);
+    expect(message.startsWith('[info] xxx')).toBe(true);
+    expect(message.endsWith(`…[truncated ${omittedCount} characters]`)).toBe(true);
+});
+
+test('Test messages at or below the cap are left untouched', () => {
+    const mockCallback = jest.fn();
+    const LogWithLimit = new Logger({
+        serverLoggingCallback: mockCallback,
+        clientLoggingCallback: jest.fn(),
+    });
+
+    LogWithLimit.info('short message', true);
+
+    const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
+    expect(packet[0].message).toBe('[info] short message');
+});
+
 test('Test getContextEmail captures email per log line', () => {
     const mockCallback = jest.fn();
     const LogWithEmail = new Logger({
