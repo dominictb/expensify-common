@@ -22,6 +22,73 @@ type LoggerOptions = {
 
 const MAX_LOG_LINES_BEFORE_FLUSH = 50;
 
+// The server rejects any single log message larger than 1,048,576 bytes.
+// Cap below that so the JSON-escaped message plus surrounding line fields stay under it.
+const MAX_LOG_LINE_BYTES = 1_000_000;
+
+/**
+ * Gets the UTF-8 byte length of a single unicode code point.
+ */
+function codePointByteSize(code: number): number {
+    if (code >= 0x10000) {
+        return 4;
+    }
+    if (code >= 0x800) {
+        return 3;
+    }
+    if (code >= 0x80) {
+        return 2;
+    }
+    return 1;
+}
+
+/**
+ * Truncates the input so the returned string (including an appended
+ * "...[truncated N bytes]" marker) fits within maxSize BYTES, where N is the number of
+ * removed bytes. Returns the input unchanged if it already fits. Iterates by code point so
+ * multi-byte UTF-8 characters are never split.
+ * @param maxSize The max size in bytes
+ */
+function truncateToByteSize(input: string, maxSize: number): string {
+    const stringInput = String(input);
+    const chars = Array.from(stringInput);
+    const totalBytes = chars.reduce((sum, char) => sum + codePointByteSize(char.codePointAt(0) ?? 0), 0);
+
+    // Fast path: already within the limit.
+    if (totalBytes <= maxSize) {
+        return stringInput;
+    }
+
+    // Marker = "...[truncated " (14) + digits(N) + " bytes]" (7) = 21 + digits(N).
+    // Reserve for the MAX possible digit count so the final marker never overflows maxSize.
+    const MARKER_STATIC_BYTES = 21;
+    const reservedMarkerBytes = MARKER_STATIC_BYTES + String(totalBytes).length;
+
+    // If maxSize can't fit even the marker, appending one would exceed the limit (and could
+    // be larger than the input), so hard-truncate the raw input to fit instead of adding one.
+    const includeMarker = maxSize >= reservedMarkerBytes;
+    const byteBudget = includeMarker ? maxSize - reservedMarkerBytes : maxSize;
+
+    let keptPrefix = '';
+    let keptBytes = 0;
+    chars.some((char) => {
+        const charBytes = codePointByteSize(char.codePointAt(0) ?? 0);
+        if (keptBytes + charBytes > byteBudget) {
+            return true;
+        }
+        keptBytes += charBytes;
+        keptPrefix += char;
+        return false;
+    });
+
+    if (!includeMarker) {
+        return keptPrefix;
+    }
+
+    const removed = totalBytes - keptBytes;
+    return `${keptPrefix}...[truncated ${removed} bytes]`;
+}
+
 export default class Logger {
     logLines: LogLine[];
 
@@ -99,8 +166,10 @@ export default class Logger {
             // Silently fail if getContextEmail throws - logging should not crash
         }
 
+        const truncatedMessage = truncateToByteSize(message, MAX_LOG_LINE_BYTES);
+
         const length = this.logLines.push({
-            message,
+            message: truncatedMessage,
             parameters,
             onlyFlushWithOthers,
             timestamp: new Date(),
@@ -184,3 +253,6 @@ export default class Logger {
         this.clientLoggingCallback(message, extraData);
     }
 }
+
+// Exported for unit testing.
+export {truncateToByteSize};
