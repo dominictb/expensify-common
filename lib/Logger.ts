@@ -22,8 +22,9 @@ type LoggerOptions = {
 
 const MAX_LOG_LINES_BEFORE_FLUSH = 50;
 
-// The server rejects any single log message larger than 1,048,576 bytes.
-// Cap below that so the JSON-escaped message plus surrounding line fields stay under it.
+// The server rejects any single serialized log line larger than 1,048,576 bytes (1 MiB).
+// We enforce a lower cap on the JSON-serialized line (message + parameters + metadata, with
+// escaping) so it stays comfortably under the server limit.
 const MAX_LOG_LINE_BYTES = 1_000_000;
 
 /**
@@ -43,50 +44,98 @@ function codePointByteSize(code: number): number {
 }
 
 /**
- * Truncates the input so the returned string (including an appended
- * "...[truncated N bytes]" marker) fits within maxSize BYTES, where N is the number of
- * removed bytes. Returns the input unchanged if it already fits. Iterates by code point so
- * multi-byte UTF-8 characters are never split.
- * @param maxSize The max size in bytes
+ * Gets the total UTF-8 byte length of a string.
  */
-function truncateToByteSize(input: string, maxSize: number): string {
-    const stringInput = String(input);
-    const chars = Array.from(stringInput);
-    const totalBytes = chars.reduce((sum, char) => sum + codePointByteSize(char.codePointAt(0) ?? 0), 0);
+function utf8ByteLength(input: string): number {
+    return Array.from(input).reduce((sum, char) => sum + codePointByteSize(char.codePointAt(0) ?? 0), 0);
+}
 
-    // Fast path: already within the limit.
-    if (totalBytes <= maxSize) {
-        return stringInput;
+/**
+ * UTF-8 byte length of a single code point *after JSON string escaping*, matching the output of
+ * JSON.stringify: `"` `\` and the short control escapes are 2 bytes, other control characters
+ * and lone surrogates become `\uXXXX` (6 bytes), everything else is its plain UTF-8 size.
+ */
+function jsonEscapedByteSize(code: number): number {
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) {
+        return 2;
     }
+    if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) {
+        return 6;
+    }
+    return codePointByteSize(code);
+}
 
-    // Marker = "...[truncated " (14) + digits(N) + " bytes]" (7) = 21 + digits(N).
-    // Reserve for the MAX possible digit count so the final marker never overflows maxSize.
+/**
+ * Truncates `message` so that the SERIALIZED `line` fits within maxSize bytes. The serialized
+ * line is `overhead(empty message) + JSON-escaped bytes of the message`, so we measure the
+ * message's escaped size directly (single pass) instead of repeatedly re-serializing the whole
+ * line. This is exact for JSON.stringify's escaping and avoids the cost of a binary search.
+ */
+function truncateMessageToFitLine(line: LogLine, message: string, maxSize: number): string {
+    const overhead = utf8ByteLength(JSON.stringify({...line, message: ''}));
+    const totalRawBytes = utf8ByteLength(message);
+
+    // Marker "...[truncated N bytes]" is escape-free ASCII, so its serialized size equals its
+    // raw size = 21 + digits(N). Reserve for the max possible N so the final line never overflows.
     const MARKER_STATIC_BYTES = 21;
-    const reservedMarkerBytes = MARKER_STATIC_BYTES + String(totalBytes).length;
+    const reservedMarkerBytes = MARKER_STATIC_BYTES + String(totalRawBytes).length;
+    const contentBudget = maxSize - overhead - reservedMarkerBytes;
 
-    // If maxSize can't fit even the marker, appending one would exceed the limit (and could
-    // be larger than the input), so hard-truncate the raw input to fit instead of adding one.
-    const includeMarker = maxSize >= reservedMarkerBytes;
-    const byteBudget = includeMarker ? maxSize - reservedMarkerBytes : maxSize;
-
-    let keptPrefix = '';
-    let keptBytes = 0;
-    chars.some((char) => {
-        const charBytes = codePointByteSize(char.codePointAt(0) ?? 0);
-        if (keptBytes + charBytes > byteBudget) {
-            return true;
-        }
-        keptBytes += charBytes;
-        keptPrefix += char;
-        return false;
-    });
-
-    if (!includeMarker) {
-        return keptPrefix;
+    if (contentBudget <= 0) {
+        return '';
     }
 
-    const removed = totalBytes - keptBytes;
-    return `${keptPrefix}...[truncated ${removed} bytes]`;
+    // Keep whole code points until the escaped budget is exhausted (never splits a character).
+    let keptUnits = 0;
+    let keptEscapedBytes = 0;
+    let keptRawBytes = 0;
+    for (let i = 0; i < message.length; ) {
+        const code = message.codePointAt(i) ?? 0;
+        const escapedBytes = jsonEscapedByteSize(code);
+        if (keptEscapedBytes + escapedBytes > contentBudget) {
+            break;
+        }
+        keptEscapedBytes += escapedBytes;
+        keptRawBytes += codePointByteSize(code);
+        const units = code > 0xffff ? 2 : 1;
+        i += units;
+        keptUnits += units;
+    }
+
+    if (keptRawBytes >= totalRawBytes) {
+        return message;
+    }
+
+    const removed = totalRawBytes - keptRawBytes;
+    return `${message.slice(0, keptUnits)}...[truncated ${removed} bytes]`;
+}
+
+/**
+ * Enforces the per-line byte limit on the actual serialized log line — what the server measures
+ * — covering the message, parameters and metadata plus JSON-escaping overhead. Oversized
+ * `parameters` (structured data we can't safely truncate mid-JSON) are replaced with a size
+ * marker; the message is then truncated to fit whatever budget remains.
+ */
+function enforceLineByteLimit(line: LogLine, maxSize: number): LogLine {
+    const serialized = JSON.stringify(line);
+
+    // Cheap fast path: at most 3 UTF-8 bytes per UTF-16 code unit, so if 3 * length fits the
+    // line is definitely under the limit and we avoid the exact byte count entirely.
+    if (serialized.length * 3 <= maxSize || utf8ByteLength(serialized) <= maxSize) {
+        return line;
+    }
+
+    const result: LogLine = {...line};
+
+    // If the line is over the limit even with an empty message, the bulk is in `parameters` —
+    // replace it with a marker so the (human-readable) message is what we keep room for.
+    if (utf8ByteLength(JSON.stringify({...result, message: ''})) > maxSize) {
+        const parametersByteSize = utf8ByteLength(JSON.stringify(result.parameters ?? ''));
+        result.parameters = {truncated: true, originalByteSize: parametersByteSize};
+    }
+
+    result.message = truncateMessageToFitLine(result, line.message, maxSize);
+    return result;
 }
 
 export default class Logger {
@@ -132,7 +181,9 @@ export default class Logger {
         const linesToLog = this.logLines?.map((l) => {
             // eslint-disable-next-line no-param-reassign
             delete l.onlyFlushWithOthers;
-            return l;
+            // Bound the serialized line to the server's per-line size limit (covers message,
+            // parameters and JSON-escaping overhead) right before it goes on the wire.
+            return enforceLineByteLimit(l, MAX_LOG_LINE_BYTES);
         });
         this.logLines = [];
         const promise = this.serverLoggingCallback(this, {
@@ -166,10 +217,8 @@ export default class Logger {
             // Silently fail if getContextEmail throws - logging should not crash
         }
 
-        const truncatedMessage = truncateToByteSize(message, MAX_LOG_LINE_BYTES);
-
         const length = this.logLines.push({
-            message: truncatedMessage,
+            message,
             parameters,
             onlyFlushWithOthers,
             timestamp: new Date(),
@@ -255,4 +304,4 @@ export default class Logger {
 }
 
 // Exported for unit testing.
-export {truncateToByteSize};
+export {truncateMessageToFitLine, enforceLineByteLimit, utf8ByteLength, MAX_LOG_LINE_BYTES};
