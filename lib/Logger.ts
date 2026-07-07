@@ -111,18 +111,19 @@ function truncateMessageToFitLine(line: LogLine, message: string, maxSize: numbe
 }
 
 /**
- * Enforces the per-line byte limit on the actual serialized log line — what the server measures
- * — covering the message, parameters and metadata plus JSON-escaping overhead. Oversized
- * `parameters` (structured data we can't safely truncate mid-JSON) are replaced with a size
- * marker; the message is then truncated to fit whatever budget remains.
+ * Serializes a log line while enforcing the per-line byte limit on the *serialized* line — what
+ * the server measures — covering the message, parameters and metadata plus JSON-escaping
+ * overhead. Returns the JSON string for the line (reused to build the packet, so each line is
+ * serialized only once). Oversized `parameters` (structured data we can't safely truncate
+ * mid-JSON) are replaced with a size marker; the message is then truncated to fit the remainder.
  */
-function enforceLineByteLimit(line: LogLine, maxSize: number): LogLine {
+function serializeLineWithinByteLimit(line: LogLine, maxSize: number): string {
     const serialized = JSON.stringify(line);
 
     // Cheap fast path: at most 3 UTF-8 bytes per UTF-16 code unit, so if 3 * length fits the
     // line is definitely under the limit and we avoid the exact byte count entirely.
     if (serialized.length * 3 <= maxSize || utf8ByteLength(serialized) <= maxSize) {
-        return line;
+        return serialized;
     }
 
     const result: LogLine = {...line};
@@ -135,7 +136,7 @@ function enforceLineByteLimit(line: LogLine, maxSize: number): LogLine {
     }
 
     result.message = truncateMessageToFitLine(result, line.message, maxSize);
-    return result;
+    return JSON.stringify(result);
 }
 
 export default class Logger {
@@ -177,18 +178,20 @@ export default class Logger {
             return;
         }
 
-        // We don't care about log setting web cookies so let's define it as false
-        const linesToLog = this.logLines?.map((l) => {
+        // We don't care about log setting web cookies so let's define it as false.
+        // Serialize each line while bounding it to the server's per-line size limit (covers
+        // message, parameters and JSON-escaping overhead). Building the packet by joining the
+        // per-line JSON keeps each line serialized only once — identical output to
+        // JSON.stringify(array) with no extra pass.
+        const serializedLines = this.logLines?.map((l) => {
             // eslint-disable-next-line no-param-reassign
             delete l.onlyFlushWithOthers;
-            // Bound the serialized line to the server's per-line size limit (covers message,
-            // parameters and JSON-escaping overhead) right before it goes on the wire.
-            return enforceLineByteLimit(l, MAX_LOG_LINE_BYTES);
+            return serializeLineWithinByteLimit(l, MAX_LOG_LINE_BYTES);
         });
         this.logLines = [];
         const promise = this.serverLoggingCallback(this, {
             api_setCookie: false,
-            logPacket: JSON.stringify(linesToLog),
+            logPacket: `[${serializedLines.join(',')}]`,
         });
         if (!promise) {
             return;
@@ -304,4 +307,4 @@ export default class Logger {
 }
 
 // Exported for unit testing.
-export {truncateMessageToFitLine, enforceLineByteLimit, utf8ByteLength, MAX_LOG_LINE_BYTES};
+export {truncateMessageToFitLine, serializeLineWithinByteLimit, utf8ByteLength, MAX_LOG_LINE_BYTES};

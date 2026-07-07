@@ -1,5 +1,5 @@
 import {TextEncoder} from 'util';
-import Logger, {truncateMessageToFitLine, enforceLineByteLimit, MAX_LOG_LINE_BYTES} from '../lib/Logger';
+import Logger, {truncateMessageToFitLine, serializeLineWithinByteLimit, MAX_LOG_LINE_BYTES} from '../lib/Logger';
 
 const MARKER_REGEX = /\.\.\.\[truncated \d+ bytes\]$/;
 // Independent, UTF-8-correct byte counter for assertions (TextEncoder is the gold standard).
@@ -229,13 +229,13 @@ describe('truncateMessageToFitLine', () => {
     });
 });
 
-describe('enforceLineByteLimit', () => {
+describe('serializeLineWithinByteLimit', () => {
     const serializedByteLength = (line) => byteLength(JSON.stringify(line));
     const makeLine = (overrides) => ({message: '', parameters: '', timestamp: new Date(0), email: null, ...overrides});
 
-    it('returns the same line unchanged when it already fits', () => {
+    it('returns the plain serialization when the line already fits', () => {
         const line = makeLine({message: '[info] hi', parameters: {a: 1}});
-        expect(enforceLineByteLimit(line, MAX_LOG_LINE_BYTES)).toBe(line);
+        expect(serializeLineWithinByteLimit(line, MAX_LOG_LINE_BYTES)).toBe(JSON.stringify(line));
     });
 
     it('truncates based on serialized (escaped) size, not raw size', () => {
@@ -247,25 +247,25 @@ describe('enforceLineByteLimit', () => {
         expect(byteLength(message)).toBeLessThanOrEqual(maxSize); // raw fits...
         expect(serializedByteLength(line)).toBeGreaterThan(maxSize); // ...serialized does not
 
-        const result = enforceLineByteLimit(line, maxSize);
-        expect(serializedByteLength(result)).toBeLessThanOrEqual(maxSize);
-        expect(result.message).toMatch(MARKER_REGEX);
+        const result = serializeLineWithinByteLimit(line, maxSize);
+        expect(byteLength(result)).toBeLessThanOrEqual(maxSize);
+        expect(JSON.parse(result).message).toMatch(MARKER_REGEX);
     });
 
     it('replaces oversized parameters with a size marker and keeps the message', () => {
         const maxSize = 300;
         const line = makeLine({message: '[info] short message', parameters: {blob: 'A'.repeat(1000)}});
-        const result = enforceLineByteLimit(line, maxSize);
-        expect(serializedByteLength(result)).toBeLessThanOrEqual(maxSize);
-        expect(result.parameters).toEqual({truncated: true, originalByteSize: expect.any(Number)});
-        expect(result.message).toBe('[info] short message');
+        const result = serializeLineWithinByteLimit(line, maxSize);
+        expect(byteLength(result)).toBeLessThanOrEqual(maxSize);
+        const parsed = JSON.parse(result);
+        expect(parsed.parameters).toEqual({truncated: true, originalByteSize: expect.any(Number)});
+        expect(parsed.message).toBe('[info] short message');
     });
 
     it('bounds the line when both message and parameters are large', () => {
         const maxSize = 300;
         const line = makeLine({message: 'M'.repeat(1000), parameters: {blob: 'P'.repeat(1000)}});
-        const result = enforceLineByteLimit(line, maxSize);
-        expect(serializedByteLength(result)).toBeLessThanOrEqual(maxSize);
+        expect(byteLength(serializeLineWithinByteLimit(line, maxSize))).toBeLessThanOrEqual(maxSize);
     });
 
     it('handles control characters that expand 6x under JSON escaping', () => {
@@ -275,7 +275,6 @@ describe('enforceLineByteLimit', () => {
         const line = makeLine({message});
         expect(byteLength(message)).toBeLessThanOrEqual(maxSize); // raw fits
         expect(serializedByteLength(line)).toBeGreaterThan(maxSize); // serialized does not
-        const result = enforceLineByteLimit(line, maxSize);
-        expect(serializedByteLength(result)).toBeLessThanOrEqual(maxSize);
+        expect(byteLength(serializeLineWithinByteLimit(line, maxSize))).toBeLessThanOrEqual(maxSize);
     });
 });
