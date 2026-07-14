@@ -193,8 +193,7 @@ export default {
          * @returns {number} The amount of tax
          */
         calculateTaxFromPercentage(total, percentage) {
-            const percentageAsDecimal = Str.percentageStringToNumber(percentage) / 100;
-            const divisor = percentage ? percentageAsDecimal + 1 : 1;
+            const divisor = percentage ? Str.percentageStringToNumber(percentage) / 100 + 1 : 1;
             return this.calculateTaxFromDivisor(total, divisor);
         },
 
