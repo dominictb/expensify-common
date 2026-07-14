@@ -1,4 +1,9 @@
-import Logger from '../lib/Logger';
+import {TextEncoder} from 'util';
+import Logger, {truncateMessageToFitLine, serializeLineWithinByteLimit, MAX_LOG_LINE_BYTES} from '../lib/Logger';
+
+const MARKER_REGEX = /\.\.\.\[truncated \d+ bytes\]$/;
+// Independent, UTF-8-correct byte counter for assertions (TextEncoder is the gold standard).
+const byteLength = (str) => new TextEncoder().encode(str).length;
 
 const mockServerLoggingCallback = jest.fn();
 const mockClientLoggingCallback = jest.fn();
@@ -99,41 +104,43 @@ test('Test Log.client()', () => {
     expect(mockClientLoggingCallback).toHaveBeenCalledWith('Test', '');
 });
 
-test('Test oversized messages are truncated before being sent to the server', () => {
-    const mockCallback = jest.fn();
-    const LogWithLimit = new Logger({
-        serverLoggingCallback: mockCallback,
-        clientLoggingCallback: jest.fn(),
-    });
+test('Test oversized message is truncated before being sent to the server', () => {
+    mockServerLoggingCallback.mockClear();
+    const huge = 'x'.repeat(1_100_000);
+    Log.info(huge, true);
 
-    const oneMegabyte = 1024 * 1024;
-    const maxLength = oneMegabyte - 1024;
-    const omittedCount = 500;
-    // `info()` prepends the "[info] " prefix, so build the raw message minus that prefix length
-    // to land the final message exactly `omittedCount` characters over the cap.
-    const prefixLength = '[info] '.length;
-    const overCapLength = maxLength + omittedCount;
-    const rawMessage = 'x'.repeat(overCapLength - prefixLength);
-    LogWithLimit.info(rawMessage, true);
-
-    const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
-    const {message} = packet[0];
-    expect(message.length).toBe(maxLength + `…[truncated ${omittedCount} characters]`.length);
-    expect(message.startsWith('[info] xxx')).toBe(true);
-    expect(message.endsWith(`…[truncated ${omittedCount} characters]`)).toBe(true);
+    const packet = JSON.parse(mockServerLoggingCallback.mock.calls.at(-1)[1].logPacket);
+    const line = packet.at(-1);
+    // The whole serialized line (what the server measures) must be under the limit.
+    expect(byteLength(JSON.stringify(line))).toBeLessThanOrEqual(1_000_000);
+    expect(line.message).toMatch(MARKER_REGEX);
 });
 
-test('Test messages at or below the cap are left untouched', () => {
-    const mockCallback = jest.fn();
-    const LogWithLimit = new Logger({
-        serverLoggingCallback: mockCallback,
-        clientLoggingCallback: jest.fn(),
+test('Test oversized parameters are bounded before being sent to the server', () => {
+    mockServerLoggingCallback.mockClear();
+    const bigParams = {blob: 'A'.repeat(1_100_000)};
+    Log.info('small message', true, bigParams);
+
+    const packet = JSON.parse(mockServerLoggingCallback.mock.calls.at(-1)[1].logPacket);
+    const line = packet.at(-1);
+    expect(byteLength(JSON.stringify(line))).toBeLessThanOrEqual(1_000_000);
+    // The large parameters are replaced with a size marker; the message is kept.
+    expect(line.parameters).toEqual({truncated: true, originalByteSize: expect.any(Number)});
+    expect(line.message).toBe('[info] small message');
+});
+
+test('Test debug client callback receives the full untruncated message', () => {
+    const mockClient = jest.fn();
+    const DebugLogInstance = new Logger({
+        serverLoggingCallback: jest.fn(),
+        clientLoggingCallback: mockClient,
+        isDebug: true,
     });
+    const huge = 'x'.repeat(1_100_000);
+    DebugLogInstance.info(huge, true);
 
-    LogWithLimit.info('short message', true);
-
-    const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
-    expect(packet[0].message).toBe('[info] short message');
+    // The local dev console should still get the full message so debugging isn't degraded.
+    expect(mockClient.mock.calls[0][0].startsWith(`[info] ${huge}`)).toBe(true);
 });
 
 test('Test getContextEmail captures email per log line', () => {
@@ -169,4 +176,105 @@ test('Test getContextEmail throwing does not break logging', () => {
     const packet = JSON.parse(mockCallback.mock.calls[0][1].logPacket);
     delete packet[0].timestamp;
     expect(packet).toEqual([{message: '[info] Test message', parameters: '', email: null}]);
+});
+
+describe('truncateMessageToFitLine', () => {
+    const makeLine = (overrides) => ({message: '', parameters: '', timestamp: new Date(0), email: null, ...overrides});
+    const serializedByteLength = (line) => byteLength(JSON.stringify(line));
+
+    test('returns the message unchanged when the line already fits', () => {
+        const message = 'hello world';
+        expect(truncateMessageToFitLine(makeLine({message}), message, MAX_LOG_LINE_BYTES)).toBe(message);
+    });
+
+    test('truncates with a byte marker so the serialized line fits', () => {
+        const message = 'a'.repeat(1000);
+        const line = makeLine({message});
+        const truncated = truncateMessageToFitLine(line, message, 200);
+        expect(truncated).toMatch(MARKER_REGEX);
+        expect(serializedByteLength({...line, message: truncated})).toBeLessThanOrEqual(200);
+    });
+
+    test('reports the correct number of removed raw bytes', () => {
+        const message = 'a'.repeat(1000);
+        const truncated = truncateMessageToFitLine(makeLine({message}), message, 200);
+        const removed = Number(truncated.match(/truncated (\d+) bytes/)[1]);
+        const keptBytes = byteLength(truncated.replace(MARKER_REGEX, ''));
+        expect(keptBytes + removed).toBe(1000);
+    });
+
+    test('does not split multi-byte (astral) characters', () => {
+        const message = '😀'.repeat(200); // each 😀 is 4 UTF-8 bytes
+        const line = makeLine({message});
+        const truncated = truncateMessageToFitLine(line, message, 200);
+        expect(serializedByteLength({...line, message: truncated})).toBeLessThanOrEqual(200);
+        const keptPrefix = truncated.replace(MARKER_REGEX, '');
+        expect(Array.from(keptPrefix).every((char) => char === '😀')).toBe(true);
+    });
+
+    test('accounts for JSON escaping (quotes serialize to 2 bytes each)', () => {
+        const message = '"'.repeat(500);
+        const line = makeLine({message});
+        const truncated = truncateMessageToFitLine(line, message, 200);
+        expect(serializedByteLength({...line, message: truncated})).toBeLessThanOrEqual(200);
+    });
+
+    test('keeps the serialized line within maxSize across digit-boundary sizes', () => {
+        const message = 'a'.repeat(2000);
+        const line = makeLine({message});
+        for (const maxSize of [120, 121, 122, 130, 220, 221, 500, 1024]) {
+            const truncated = truncateMessageToFitLine(line, message, maxSize);
+            expect(serializedByteLength({...line, message: truncated})).toBeLessThanOrEqual(maxSize);
+        }
+    });
+});
+
+describe('serializeLineWithinByteLimit', () => {
+    const serializedByteLength = (line) => byteLength(JSON.stringify(line));
+    const makeLine = (overrides) => ({message: '', parameters: '', timestamp: new Date(0), email: null, ...overrides});
+
+    it('returns the plain serialization when the line already fits', () => {
+        const line = makeLine({message: '[info] hi', parameters: {a: 1}});
+        expect(serializeLineWithinByteLimit(line, MAX_LOG_LINE_BYTES)).toBe(JSON.stringify(line));
+    });
+
+    it('truncates based on serialized (escaped) size, not raw size', () => {
+        const maxSize = 300;
+        // All double-quotes: raw byte length == maxSize (a naive raw-byte cap would leave this
+        // unchanged), but each quote serializes to 2 bytes so the serialized line is ~2x over.
+        const message = '"'.repeat(maxSize);
+        const line = makeLine({message});
+        expect(byteLength(message)).toBeLessThanOrEqual(maxSize); // raw fits...
+        expect(serializedByteLength(line)).toBeGreaterThan(maxSize); // ...serialized does not
+
+        const result = serializeLineWithinByteLimit(line, maxSize);
+        expect(byteLength(result)).toBeLessThanOrEqual(maxSize);
+        expect(JSON.parse(result).message).toMatch(MARKER_REGEX);
+    });
+
+    it('replaces oversized parameters with a size marker and keeps the message', () => {
+        const maxSize = 300;
+        const line = makeLine({message: '[info] short message', parameters: {blob: 'A'.repeat(1000)}});
+        const result = serializeLineWithinByteLimit(line, maxSize);
+        expect(byteLength(result)).toBeLessThanOrEqual(maxSize);
+        const parsed = JSON.parse(result);
+        expect(parsed.parameters).toEqual({truncated: true, originalByteSize: expect.any(Number)});
+        expect(parsed.message).toBe('[info] short message');
+    });
+
+    it('bounds the line when both message and parameters are large', () => {
+        const maxSize = 300;
+        const line = makeLine({message: 'M'.repeat(1000), parameters: {blob: 'P'.repeat(1000)}});
+        expect(byteLength(serializeLineWithinByteLimit(line, maxSize))).toBeLessThanOrEqual(maxSize);
+    });
+
+    it('handles control characters that expand 6x under JSON escaping', () => {
+        const maxSize = 200;
+        // \x01 is 1 raw byte but serializes to the 6-byte escape "\u0001".
+        const message = '\x01'.repeat(maxSize);
+        const line = makeLine({message});
+        expect(byteLength(message)).toBeLessThanOrEqual(maxSize); // raw fits
+        expect(serializedByteLength(line)).toBeGreaterThan(maxSize); // serialized does not
+        expect(byteLength(serializeLineWithinByteLimit(line, maxSize))).toBeLessThanOrEqual(maxSize);
+    });
 });
